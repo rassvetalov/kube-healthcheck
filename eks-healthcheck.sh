@@ -58,7 +58,7 @@ CRD_COUNT=$(echo "$CRD_JSON" | jq '.items | length')
 # ═══════════════════════════════════════════════════════════
 # 1) KUBERNETES VERSIONS & NODE AMI CHECK
 # ═══════════════════════════════════════════════════════════
-echo "[1/8] KUBERNETES VERSIONS & NODE AMI CHECK:"
+echo "[1/11] KUBERNETES VERSIONS & NODE AMI CHECK:"
 
 NODES_JSON=$(kubectl get nodes -o json 2>/dev/null || echo '{"items":[]}')
 
@@ -144,7 +144,7 @@ echo ""
 # ═══════════════════════════════════════════════════════════
 # 2) POD HEALTH (single API call, checks CrashLoop + ImagePull)
 # ═══════════════════════════════════════════════════════════
-echo "[2/8] POD HEALTH:"
+echo "[2/11] POD HEALTH:"
 
 PODS_JSON=$(kubectl get pods -A -o json 2>/dev/null || echo '{"items":[]}')
 
@@ -191,13 +191,44 @@ if [[ "$PENDING" -gt 0 ]]; then
   POD_OK=false
 fi
 
-[[ "$POD_OK" == "true" ]] && echo -e "  All pods running ${G}✓${N}"
+# --- High restart count ---
+RESTART_THRESHOLD=5
+HIGH_RESTART=$(echo "$PODS_JSON" | jq --argjson t "$RESTART_THRESHOLD" '[.items[] | select(
+  [(.status.containerStatuses // [])[], (.status.initContainerStatuses // [])[]]
+  | any(.restartCount > $t)
+)] | length')
+
+if [[ "$HIGH_RESTART" -gt 0 ]]; then
+  echo -e "  High restarts (>$RESTART_THRESHOLD): $HIGH_RESTART pods ${Y}!${N}"
+  echo "$PODS_JSON" | jq -r --argjson t "$RESTART_THRESHOLD" '.items[] | select(
+    [(.status.containerStatuses // [])[], (.status.initContainerStatuses // [])[]]
+    | any(.restartCount > $t)
+  ) | "    \(.metadata.namespace)/\(.metadata.name) (\([(.status.containerStatuses // [])[] | select(.restartCount > $t) | "\(.name)=\(.restartCount)"] | join(", ")))"' | head -5
+  POD_OK=false; issue "$HIGH_RESTART pods with high restart count"
+fi
+
+# --- OOMKilled ---
+OOM_KILLED=$(echo "$PODS_JSON" | jq '[.items[] | select(
+  [(.status.containerStatuses // [])[], (.status.initContainerStatuses // [])[]]
+  | any(.lastState.terminated.reason == "OOMKilled")
+)] | length')
+
+if [[ "$OOM_KILLED" -gt 0 ]]; then
+  echo -e "  OOMKilled: $OOM_KILLED pods ${R}✗${N}"
+  echo "$PODS_JSON" | jq -r '.items[] | select(
+    [(.status.containerStatuses // [])[], (.status.initContainerStatuses // [])[]]
+    | any(.lastState.terminated.reason == "OOMKilled")
+  ) | "    \(.metadata.namespace)/\(.metadata.name)"' | head -5
+  POD_OK=false; issue "$OOM_KILLED pods with OOMKilled"
+fi
+
+[[ "$POD_OK" == "true" ]] && echo -e "  All pods healthy ${G}✓${N}"
 echo ""
 
 # ═══════════════════════════════════════════════════════════
 # 3) NODE STATUS (reuses NODES_JSON, adds pressure conditions)
 # ═══════════════════════════════════════════════════════════
-echo "[3/8] NODE STATUS:"
+echo "[3/11] NODE STATUS:"
 
 TOTAL_NODES=$(echo "$NODES_JSON" | jq '.items | length')
 NOT_READY=$(echo "$NODES_JSON" | jq '[.items[] | select(
@@ -226,10 +257,50 @@ fi
 echo ""
 
 # ═══════════════════════════════════════════════════════════
-# 4) DAEMONSET HEALTH
+# 4) WORKLOAD HEALTH (Deployments, StatefulSets, DaemonSets)
 # ═══════════════════════════════════════════════════════════
-echo "[4/8] DAEMONSET HEALTH:"
+echo "[4/11] WORKLOAD HEALTH:"
 
+# Fetch Deployments + StatefulSets (reused later in orphan detection)
+WORKLOADS_JSON=$(kubectl get deployments,statefulsets -A -o json 2>/dev/null || echo '{"items":[]}')
+
+# --- Deployments ---
+DEPLOY_TOTAL=$(echo "$WORKLOADS_JSON" | jq '[.items[] | select(.kind == "Deployment")] | length')
+DEPLOY_BAD=$(echo "$WORKLOADS_JSON" | jq '[.items[] | select(
+  .kind == "Deployment" and (.spec.replicas // 0) != (.status.availableReplicas // 0)
+)] | length')
+
+if [[ "$DEPLOY_TOTAL" -eq 0 ]]; then
+  echo -e "  Deployments: none ${Y}⊘${N}"
+elif [[ "$DEPLOY_BAD" -eq 0 ]]; then
+  echo -e "  Deployments: $DEPLOY_TOTAL healthy ${G}✓${N}"
+else
+  echo -e "  Deployments: $DEPLOY_BAD/$DEPLOY_TOTAL not fully available ${R}✗${N}"
+  echo "$WORKLOADS_JSON" | jq -r '.items[] | select(
+    .kind == "Deployment" and (.spec.replicas // 0) != (.status.availableReplicas // 0)
+  ) | "    \(.metadata.namespace)/\(.metadata.name) (want=\(.spec.replicas // 0), available=\(.status.availableReplicas // 0))"' | head -5
+  issue "$DEPLOY_BAD Deployments not fully available"
+fi
+
+# --- StatefulSets ---
+STS_TOTAL=$(echo "$WORKLOADS_JSON" | jq '[.items[] | select(.kind == "StatefulSet")] | length')
+STS_BAD=$(echo "$WORKLOADS_JSON" | jq '[.items[] | select(
+  .kind == "StatefulSet" and (.spec.replicas // 0) != (.status.readyReplicas // 0)
+)] | length')
+
+if [[ "$STS_TOTAL" -eq 0 ]]; then
+  echo -e "  StatefulSets: none ${Y}⊘${N}"
+elif [[ "$STS_BAD" -eq 0 ]]; then
+  echo -e "  StatefulSets: $STS_TOTAL healthy ${G}✓${N}"
+else
+  echo -e "  StatefulSets: $STS_BAD/$STS_TOTAL not fully ready ${R}✗${N}"
+  echo "$WORKLOADS_JSON" | jq -r '.items[] | select(
+    .kind == "StatefulSet" and (.spec.replicas // 0) != (.status.readyReplicas // 0)
+  ) | "    \(.metadata.namespace)/\(.metadata.name) (want=\(.spec.replicas // 0), ready=\(.status.readyReplicas // 0))"' | head -5
+  issue "$STS_BAD StatefulSets not fully ready"
+fi
+
+# --- DaemonSets ---
 DS_JSON=$(kubectl get daemonsets -A -o json 2>/dev/null || echo '{"items":[]}')
 DS_TOTAL=$(echo "$DS_JSON" | jq '.items | length')
 DS_BAD=$(echo "$DS_JSON" | jq '[.items[] | select(
@@ -237,11 +308,11 @@ DS_BAD=$(echo "$DS_JSON" | jq '[.items[] | select(
 )] | length')
 
 if [[ "$DS_TOTAL" -eq 0 ]]; then
-  echo -e "  No DaemonSets ${Y}⊘${N}"
+  echo -e "  DaemonSets: none ${Y}⊘${N}"
 elif [[ "$DS_BAD" -eq 0 ]]; then
-  echo -e "  $DS_TOTAL DaemonSets healthy ${G}✓${N}"
+  echo -e "  DaemonSets: $DS_TOTAL healthy ${G}✓${N}"
 else
-  echo -e "  $DS_BAD/$DS_TOTAL DaemonSets not fully ready ${R}✗${N}"
+  echo -e "  DaemonSets: $DS_BAD/$DS_TOTAL not fully ready ${R}✗${N}"
   echo "$DS_JSON" | jq -r '.items[] | select(.status.desiredNumberScheduled != .status.numberReady) |
     "    \(.metadata.namespace)/\(.metadata.name) (desired=\(.status.desiredNumberScheduled), ready=\(.status.numberReady // 0))"' | head -5
   issue "$DS_BAD DaemonSets not ready"
@@ -251,7 +322,9 @@ echo ""
 # ═══════════════════════════════════════════════════════════
 # 5) HELM RELEASES
 # ═══════════════════════════════════════════════════════════
-echo "[5/8] HELM RELEASES:"
+echo "[5/11] HELM RELEASES:"
+HELM_JSON='[]'
+HELM_TOTAL=0
 if command -v helm >/dev/null 2>&1; then
   HELM_JSON=$(helm list -A -o json 2>/dev/null || echo '[]')
   HELM_TOTAL=$(echo "$HELM_JSON" | jq 'length')
@@ -275,7 +348,7 @@ echo ""
 # ═══════════════════════════════════════════════════════════
 # 6) KUBE-SYSTEM & PVC
 # ═══════════════════════════════════════════════════════════
-echo "[6/8] KUBE-SYSTEM & PVC:"
+echo "[6/11] KUBE-SYSTEM & PVC:"
 
 SYS_FAILED=$(echo "$PODS_JSON" | jq '[.items[] | select(
   .metadata.namespace == "kube-system" and
@@ -309,7 +382,157 @@ fi
 echo ""
 
 # ═══════════════════════════════════════════════════════════
-# CRD FETCH — parallel (max 10), feeds sections 7-8
+# 7) SERVICE ENDPOINTS
+# ═══════════════════════════════════════════════════════════
+echo "[7/11] SERVICE ENDPOINTS:"
+
+# Save to temp files to avoid "argument list too long" in large clusters
+kubectl get services -A -o json 2>/dev/null > "$CRD_TMPDIR/_svc.json" || echo '{"items":[]}' > "$CRD_TMPDIR/_svc.json"
+kubectl get endpoints -A -o json 2>/dev/null > "$CRD_TMPDIR/_ep.json" || echo '{"items":[]}' > "$CRD_TMPDIR/_ep.json"
+
+# Services with selectors (not headless, not ExternalName)
+SVC_WITH_SEL=$(jq '[.items[] | select(
+  .spec.type != "ExternalName" and
+  .spec.clusterIP != "None" and
+  ((.spec.selector // {}) | length) > 0
+)] | length' "$CRD_TMPDIR/_svc.json")
+
+NO_EP_LIST=$(jq -n --slurpfile svc "$CRD_TMPDIR/_svc.json" --slurpfile ep "$CRD_TMPDIR/_ep.json" '
+  ($ep[0].items | map({
+    key: "\(.metadata.namespace)/\(.metadata.name)",
+    value: ([(.subsets // [])[] | (.addresses // [])[] ] | length)
+  }) | from_entries) as $ep_map |
+  [
+    $svc[0].items[] | select(
+      .spec.type != "ExternalName" and
+      .spec.clusterIP != "None" and
+      ((.spec.selector // {}) | length) > 0 and
+      ($ep_map["\(.metadata.namespace)/\(.metadata.name)"] // 0) == 0
+    ) | "\(.metadata.namespace)/\(.metadata.name)"
+  ]')
+
+NO_EP_COUNT=$(echo "$NO_EP_LIST" | jq 'length')
+
+if [[ "$SVC_WITH_SEL" -eq 0 ]]; then
+  echo -e "  No services with selectors ${Y}⊘${N}"
+elif [[ "$NO_EP_COUNT" -eq 0 ]]; then
+  echo -e "  $SVC_WITH_SEL services — all have endpoints ${G}✓${N}"
+else
+  echo -e "  $NO_EP_COUNT/$SVC_WITH_SEL services have no ready endpoints ${R}✗${N}"
+  echo "$NO_EP_LIST" | jq -r '.[:5][] | "    \(.)"'
+  issue "$NO_EP_COUNT services without endpoints"
+fi
+echo ""
+
+# ═══════════════════════════════════════════════════════════
+# 8) TLS CERTIFICATES
+# ═══════════════════════════════════════════════════════════
+echo "[8/11] TLS CERTIFICATES:"
+
+if command -v openssl >/dev/null 2>&1; then
+  TLS_WARN_DAYS=30
+  kubectl get secrets -A --field-selector type=kubernetes.io/tls -o json 2>/dev/null > "$CRD_TMPDIR/_tls.json" || echo '{"items":[]}' > "$CRD_TMPDIR/_tls.json"
+  TLS_COUNT=$(jq '.items | length' "$CRD_TMPDIR/_tls.json")
+
+  if [[ "$TLS_COUNT" -eq 0 ]]; then
+    echo -e "  No TLS secrets found ${Y}⊘${N}"
+  else
+    TLS_EXPIRED=0
+    TLS_EXPIRING=0
+    TLS_SHOWN=0
+    NOW_EPOCH=$(date +%s)
+    WARN_EPOCH=$((NOW_EPOCH + TLS_WARN_DAYS * 86400))
+
+    while IFS=$'\t' read -r ns name cert_b64; do
+      [[ -z "$cert_b64" || "$cert_b64" == "null" ]] && continue
+      expiry=$(echo "$cert_b64" | base64 -d 2>/dev/null | openssl x509 -noout -enddate 2>/dev/null | sed 's/notAfter=//')
+      [[ -z "$expiry" ]] && continue
+      expiry_epoch=$(date -d "$expiry" +%s 2>/dev/null)
+      [[ -z "$expiry_epoch" ]] && continue
+
+      if [[ "$expiry_epoch" -lt "$NOW_EPOCH" ]]; then
+        TLS_EXPIRED=$((TLS_EXPIRED + 1))
+        [[ "$TLS_SHOWN" -lt 5 ]] && echo -e "    ${R}EXPIRED${N}: $ns/$name (expired: $expiry)"
+        TLS_SHOWN=$((TLS_SHOWN + 1))
+      elif [[ "$expiry_epoch" -lt "$WARN_EPOCH" ]]; then
+        TLS_EXPIRING=$((TLS_EXPIRING + 1))
+        days_left=$(( (expiry_epoch - NOW_EPOCH) / 86400 ))
+        [[ "$TLS_SHOWN" -lt 5 ]] && echo -e "    ${Y}EXPIRING${N}: $ns/$name (${days_left}d left)"
+        TLS_SHOWN=$((TLS_SHOWN + 1))
+      fi
+    done < <(jq -r '.items[] | [.metadata.namespace, .metadata.name, (.data."tls.crt" // "")] | @tsv' "$CRD_TMPDIR/_tls.json")
+
+    if [[ "$TLS_EXPIRED" -gt 0 ]]; then
+      echo -e "  $TLS_EXPIRED expired + $TLS_EXPIRING expiring within ${TLS_WARN_DAYS}d (of $TLS_COUNT total) ${R}✗${N}"
+      issue "$TLS_EXPIRED expired TLS certificates"
+      [[ "$TLS_EXPIRING" -gt 0 ]] && issue "$TLS_EXPIRING TLS certs expiring within ${TLS_WARN_DAYS}d"
+    elif [[ "$TLS_EXPIRING" -gt 0 ]]; then
+      echo -e "  $TLS_EXPIRING expiring within ${TLS_WARN_DAYS}d (of $TLS_COUNT total) ${Y}!${N}"
+      issue "$TLS_EXPIRING TLS certs expiring within ${TLS_WARN_DAYS}d"
+    else
+      echo -e "  $TLS_COUNT TLS certificates valid ${G}✓${N}"
+    fi
+  fi
+else
+  echo -e "  openssl not available ${Y}⊘${N}"
+fi
+echo ""
+
+# ═══════════════════════════════════════════════════════════
+# 9) DEPRECATED HELM APIS
+# ═══════════════════════════════════════════════════════════
+echo "[9/11] DEPRECATED HELM APIS:"
+
+if command -v helm >/dev/null 2>&1 && [[ "$HELM_TOTAL" -gt 0 ]]; then
+  AVAIL_APIS=$(kubectl api-versions 2>/dev/null | sort -u)
+
+  # Fetch manifests in parallel, extract apiVersions
+  HELM_API_DIR="$CRD_TMPDIR/_helm_apis"
+  mkdir -p "$HELM_API_DIR"
+  echo -n "  Scanning $HELM_TOTAL releases..."
+
+  while IFS=$'\t' read -r ns name; do
+    (helm get manifest "$name" -n "$ns" 2>/dev/null \
+      | grep -E '^apiVersion:' | sed 's/apiVersion: *//; s/"//g; s/'\''//g' | sort -u \
+      > "$HELM_API_DIR/${ns}__${name}.txt") &
+    while [[ $(jobs -rp | wc -l) -ge 10 ]]; do sleep 0.1; done
+  done < <(echo "$HELM_JSON" | jq -r '.[] | "\(.namespace)\t\(.name)"')
+  wait
+  echo " done"
+
+  DEP_COUNT=0
+  shopt -s nullglob
+  for f in "$HELM_API_DIR"/*.txt; do
+    [[ ! -s "$f" ]] && continue
+    fname=$(basename "$f" .txt)
+    ns="${fname%%__*}"
+    release="${fname#*__}"
+
+    while read -r av; do
+      [[ -z "$av" ]] && continue
+      if ! echo "$AVAIL_APIS" | grep -qxF "$av"; then
+        DEP_COUNT=$((DEP_COUNT + 1))
+        [[ "$DEP_COUNT" -le 5 ]] && echo -e "    ${R}✗${N} $ns/$release uses removed API: ${B}$av${N}"
+        break
+      fi
+    done < "$f"
+  done
+  shopt -u nullglob
+
+  if [[ "$DEP_COUNT" -eq 0 ]]; then
+    echo -e "  All Helm manifests use current APIs ${G}✓${N}"
+  else
+    [[ "$DEP_COUNT" -gt 5 ]] && echo "    ... and $((DEP_COUNT - 5)) more"
+    echo -e "  $DEP_COUNT releases with removed/unavailable APIs ${R}✗${N}"
+    issue "$DEP_COUNT Helm releases with removed APIs"
+  fi
+else
+  echo -e "  Helm not available or no releases ${Y}⊘${N}"
+fi
+echo ""
+
+# ═══════════════════════════════════════════════════════════
+# CRD FETCH — parallel (max 10), feeds sections 10-11
 # Safe: main() runs in subshell via pipe, wait won't see tee
 # ═══════════════════════════════════════════════════════════
 if [[ "$CRD_COUNT" -gt 0 ]]; then
@@ -333,9 +556,9 @@ if [[ "$CRD_COUNT" -gt 0 ]]; then
 fi
 
 # ═══════════════════════════════════════════════════════════
-# 7) CRD HEALTH — universal scan, no hardcoded operators
+# 10) CRD HEALTH — universal scan, no hardcoded operators
 # ═══════════════════════════════════════════════════════════
-echo "[7/8] CRD HEALTH:"
+echo "[10/11] CRD HEALTH:"
 
 # "Good" phases — everything else is a problem
 GOOD_PHASES="Running|Active|Enabled|Bound|Completed|Succeeded|Ready|Available|Operational|Healthy"
@@ -411,11 +634,11 @@ fi
 echo ""
 
 # ═══════════════════════════════════════════════════════════
-# 9) ORPHANED CRDs
+# 11) ORPHANED CRDs (reuses WORKLOADS_JSON from section 4)
 # ═══════════════════════════════════════════════════════════
-echo "[8/8] ORPHANED CRDs:"
+echo "[11/11] ORPHANED CRDs:"
 
-ALL_CONTROLLERS=$(kubectl get deployments,statefulsets -A -o json 2>/dev/null | jq -r '[.items[] | {
+ALL_CONTROLLERS=$(echo "$WORKLOADS_JSON" | jq -r '[.items[] | {
   ns: .metadata.namespace, name: .metadata.name,
   ready: (.status.readyReplicas // 0),
   nameNorm: (.metadata.name | ascii_downcase | gsub("-";"")),
